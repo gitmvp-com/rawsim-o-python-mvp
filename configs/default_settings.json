@@ -1,0 +1,20 @@
+{
+  "simulation_duration": 3600.0,
+  "time_step": 0.1,
+  "seed": 42,
+  "order_generation": {
+    "enabled": true,
+    "rate": 0.5,
+    "items_per_order_min": 1,
+    "items_per_order_max": 5
+  },
+  "statistics": {
+    "snapshot_interval": 10.0,
+    "export_time_series": true,
+    "export_summary": true
+  },
+  "logging": {
+    "level": "INFO",
+    "log_file": null
+  }
+}
