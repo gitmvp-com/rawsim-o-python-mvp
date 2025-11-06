@@ -1,0 +1,30 @@
+{
+  "pathfinding": {
+    "method": "WHCAvStar",
+    "params": {
+      "window_size": 10,
+      "heuristic": "euclidean"
+    }
+  },
+  "task_assignment": {
+    "method": "nearest",
+    "params": {
+      "consider_distance": true,
+      "consider_workload": false
+    }
+  },
+  "pod_selection": {
+    "method": "nearest",
+    "params": {
+      "prefer_full_pods": false
+    }
+  },
+  "repositioning": {
+    "enabled": false,
+    "threshold_picks": 10
+  },
+  "collision_handling": {
+    "enabled": true,
+    "penalty_time": 5.0
+  }
+}
