@@ -1,0 +1,836 @@
+# RAWSim-O Python Implementation - Cursor AI Rules
+# Based on the original C# implementation by merschformann/RAWSim-O
+# This file contains critical logic patterns and architectural rules
+
+## Project Overview
+
+RAWSim-O is a discrete event-based simulation for Robotic Mobile Fulfillment Systems (RMFS).
+This Python implementation maintains the exact same logic as the original C#/.NET version.
+
+## Core Architecture Principles
+
+### 1. Discrete Event Simulation Pattern
+
+```python
+# CRITICAL: All updateable entities must implement GetNextEventTime
+# The simulation advances by finding the minimum next event time across all entities
+
+class IUpdateable:
+    def GetNextEventTime(self, currentTime: float) -> float:
+        """Returns the next time this entity needs to be updated.
+        Return float('inf') if no specific update needed."""
+        pass
+    
+    def Update(self, lastTime: float, currentTime: float):
+        """Update entity state from lastTime to currentTime."""
+        pass
+
+# Event-driven execution loop (Executor pattern):
+# 1. Find minimum next event time across all updateables
+# 2. Advance simulation time to that point
+# 3. Update all entities that have events at current time
+# 4. Repeat until simulation duration reached
+```
+
+### 2. Bot State Machine Architecture
+
+```python
+# CRITICAL: Bot behavior is controlled by a STATE QUEUE (not a single state)
+# States are FIFO - execute current state, when complete, dequeue and execute next
+
+class BotNormal:
+    def __init__(self):
+        self._state_queue: Queue[IBotState] = Queue()  # FIFO queue of states
+        self.current_waypoint: Waypoint = None
+        self.next_waypoint: Waypoint = None
+        self.destination_waypoint: Waypoint = None
+        self.request_reoptimization: bool = False
+        
+        # Movement timing (CRITICAL for physics simulation)
+        self._wait_until: float = -1.0      # Blocked until this time
+        self._rotate_duration: float = -1.0  # Time needed to rotate
+        self._drive_duration: float = -1.0   # Time needed to drive
+        self._start_orientation: float = 0.0
+        self._end_orientation: float = 0.0
+    
+    def AssignTask(self, task: BotTask):
+        """Assign a new task - CLEARS all previous states and builds new state queue."""
+        # CRITICAL: Always clear state queue when assigning new task
+        self._state_queue.clear()
+        
+        # Build state queue based on task type
+        if task.type == BotTaskType.EXTRACT:
+            # Example: Extract task flow
+            if task.reserved_pod != self.pod:
+                # 1. Move to pod location
+                self._append_move_states(self.current_waypoint, task.reserved_pod.waypoint)
+                # 2. Pickup pod
+                self._state_queue.put(BotPickupPod(task.reserved_pod))
+                # 3. Move to output station
+                self._append_move_states(task.reserved_pod.waypoint, task.output_station.waypoint)
+            else:
+                # Already have pod, just move to station
+                self._append_move_states(self.current_waypoint, task.output_station.waypoint)
+            # 4. Put items (final state)
+            self._state_queue.put(BotPutItems(task))
+    
+    def _append_move_states(self, from_wp: Waypoint, to_wp: Waypoint):
+        """CRITICAL: Handle elevators when moving between different tiers."""
+        # Check if waypoints are on different tiers
+        elevator_sequence = self.instance.controller.path_manager.FindElevatorSequence(
+            self, from_wp, to_wp
+        )
+        
+        # Add move + elevator states for each checkpoint
+        for elevator, wp_from, wp_to in elevator_sequence:
+            self._state_queue.put(BotMove(wp_to))
+            self._state_queue.put(UseElevator(elevator, wp_from, wp_to))
+        
+        # Final move to destination
+        self._state_queue.put(BotMove(to_wp))
+    
+    def DequeueState(self, lastTime: float, currentTime: float):
+        """Remove completed state and activate next state in queue."""
+        completed_state = self._state_queue.get()
+        
+        # If there's a next state, activate it
+        if not self._state_queue.empty():
+            next_state = self._state_queue.queue[0]  # Peek without removing
+            next_state.Act(self, lastTime, currentTime)
+```
+
+### 3. Bot States - Individual State Logic
+
+```python
+# Each state implements IBotState interface
+
+class IBotState:
+    def Act(self, bot: Bot, lastTime: float, currentTime: float):
+        """Execute state logic. Called every update until state completes."""
+        pass
+    
+    @property
+    def Type(self) -> BotStateType:
+        pass
+
+# CRITICAL STATE: BotMove - Most complex state
+class BotMove(IBotState):
+    def __init__(self, destination: Waypoint):
+        self.destination_waypoint = destination
+        self._initialized = False
+    
+    def Act(self, bot: BotNormal, lastTime: float, currentTime: float):
+        """CRITICAL: Move state drives pathfinding and movement."""
+        
+        # Initialize on first execution
+        if not self._initialized:
+            bot.stat_last_trip_start_time = currentTime
+            self._initialized = True
+        
+        # Don't act while bot is moving
+        if bot.GetSpeed() > 0:
+            return
+        
+        # Set destination
+        bot.destination_waypoint = self.destination_waypoint
+        
+        # Check if arrived
+        if bot.current_waypoint == bot.destination_waypoint:
+            # Arrived! Remove this state
+            bot.DequeueState(lastTime, currentTime)
+            return
+        
+        # Already moving to next waypoint
+        if bot.next_waypoint is not None:
+            return
+        
+        # Need a path?
+        if bot.path is None or bot.path.count == 0:
+            bot.request_reoptimization = True
+            return
+        
+        # Check if we reached the next waypoint in our path
+        if bot.instance.controller.path_manager.GetWaypointByNodeId(bot.path.next_action.node) != bot.current_waypoint:
+            # Not there yet - try to reserve next waypoint
+            success = bot.setNextWaypoint(
+                bot.instance.controller.path_manager.GetWaypointByNodeId(bot.path.next_action.node),
+                currentTime
+            )
+            if not success:
+                # Reservation failed - wait and try again
+                bot._wait_until = currentTime + 1.0
+        else:
+            # Reached waypoint - pop it from path
+            if bot.path.next_action.stop_at_node and bot.path.next_action.wait_time_after_stop > 0:
+                bot._wait_until = currentTime + bot.path.next_action.wait_time_after_stop
+            
+            bot.path.RemoveFirstAction()
+            
+            # Skip non-stopping nodes
+            while bot.path.count > 0 and not bot.path.next_action.stop_at_node:
+                bot.path.RemoveFirstAction()
+            
+            # Set next waypoint if path continues
+            if bot.path.count > 0:
+                success = bot.setNextWaypoint(
+                    bot.instance.controller.path_manager.GetWaypointByNodeId(bot.path.next_action.node),
+                    currentTime
+                )
+
+# Other critical states:
+class BotPickupPod(IBotState):
+    """Pickup pod at current location - blocks bot for pod_transfer_time."""
+    pass
+
+class BotSetdownPod(IBotState):
+    """Set down pod at current location - blocks bot for pod_transfer_time."""
+    pass
+
+class BotGetItems(IBotState):
+    """Get items from input station - waits for station to deposit bundle."""
+    pass
+
+class BotPutItems(IBotState):
+    """Put items to output station - waits for station to pick items."""
+    pass
+
+class UseElevator(IBotState):
+    """Use elevator to change tiers - blocks for elevator travel time."""
+    pass
+
+class BotRest(IBotState):
+    """Rest at location - blocks for configured rest time."""
+    pass
+```
+
+### 4. Movement Physics - CRITICAL Implementation
+
+```python
+class BotNormal:
+    def Update(self, lastTime: float, currentTime: float):
+        """CRITICAL: Three-phase movement - Wait → Rotate → Drive."""
+        
+        # Phase 1: Check if blocked (waiting)
+        if self._wait_until >= currentTime:
+            self._update_statistics(currentTime - lastTime, self.x, self.y)
+            return
+        
+        # Get current task if needed
+        if self._state_queue.empty():
+            if self.current_task is not None:
+                self.instance.controller.bot_manager.TaskComplete(self, self.current_task)
+            self.instance.controller.bot_manager.RequestNewTask(self)
+        
+        # Execute current state
+        if not self._state_queue.empty():
+            current_state = self._state_queue.queue[0]
+            current_state.Act(self, lastTime, currentTime)
+        
+        # Check blocking again
+        if self._wait_until >= currentTime:
+            return
+        
+        # Phase 2 & 3: Update movement
+        self._update_drive(lastTime, currentTime)
+        
+        # Execute state again after movement
+        if not self._state_queue.empty():
+            current_state = self._state_queue.queue[0]
+            current_state.Act(self, lastTime, currentTime)
+        
+        # Update statistics
+        self._update_statistics(currentTime - lastTime, old_x, old_y)
+    
+    def _update_drive(self, lastTime: float, currentTime: float):
+        """CRITICAL: Handle rotation then movement."""
+        
+        # Are we still rotating?
+        if self._wait_until + self._rotate_duration >= currentTime:
+            self._update_rotation(currentTime)
+        else:
+            # Complete rotation if needed
+            if self._end_orientation != self.orientation:
+                self.orientation = self._end_orientation
+                self._start_orientation = self._end_orientation
+                if self.pod is not None and self.instance.setting_config.rotate_pods:
+                    self.pod.orientation = self._end_orientation
+            
+            # Now move (if we have a target)
+            if self.next_waypoint is not None:
+                self._update_move(currentTime)
+    
+    def _update_rotation(self, currentTime: float):
+        """Update rotation towards target orientation."""
+        # Stop linear movement
+        self.x_velocity = self.y_velocity = 0
+        
+        # Calculate current orientation using physics
+        self.orientation = self.physics.getOrientationAfterTimeStep(
+            self._start_orientation,
+            self._end_orientation,
+            currentTime - self._wait_until
+        )
+        
+        # Rotate pod if configured
+        if self.pod is not None and self.instance.setting_config.rotate_pods:
+            self.pod.orientation = self.orientation
+    
+    def _update_move(self, currentTime: float):
+        """CRITICAL: Move bot using physics calculations."""
+        # Calculate distance traveled using physics
+        distance_traveled, speed = self.physics.GetDistanceTraveledAfterTimeStep(
+            initial_velocity=0,
+            time_step=min(self._drive_duration, currentTime - self._wait_until - self._rotate_duration)
+        )
+        
+        # Set velocity
+        self.x_velocity = math.cos(self.orientation) * speed
+        self.y_velocity = math.sin(self.orientation) * speed
+        
+        # Calculate position along path
+        travel_percentage = distance_traveled / self.next_waypoint.GetDistance(self.current_waypoint)
+        
+        # Interpolate position
+        x_new = self.current_waypoint.x * (1 - travel_percentage) + self.next_waypoint.x * travel_percentage
+        y_new = self.current_waypoint.y * (1 - travel_percentage) + self.next_waypoint.y * travel_percentage
+        
+        # Check if arrived
+        if currentTime >= self._wait_until + self._rotate_duration + self._drive_duration:
+            # Reached goal
+            self.x_velocity = self.y_velocity = 0
+            x_new = self.next_waypoint.x
+            y_new = self.next_waypoint.y
+            self.current_waypoint = self.next_waypoint
+            self.next_waypoint = None
+        
+        # Try to move (collision detection)
+        if not self.instance.compound.bot_current_tier[self].MoveBotOverride(self, x_new, y_new):
+            # Potential collision detected
+            self.instance.bot_crash_handler.AddPotentialCrashBot(self)
+    
+    def setNextWaypoint(self, waypoint: Waypoint, currentTime: float) -> bool:
+        """CRITICAL: Reserve next waypoint in reservation table."""
+        # Can't set while moving
+        if self.GetSpeed() > 0:
+            return False
+        
+        # Already there?
+        if self.x == waypoint.x and self.y == waypoint.y:
+            raise ValueError("Already at the given waypoint!")
+        
+        # Calculate rotation and movement times
+        self._start_orientation = self.orientation
+        self._end_orientation = Circle.GetOrientation(self.x, self.y, waypoint.x, waypoint.y)
+        rotate_duration = self.physics.getTimeNeededToTurn(self._start_orientation, self._end_orientation)
+        wait_until = max(self._wait_until, currentTime)
+        
+        # Try to register with path manager
+        success = self.instance.controller.path_manager.RegisterNextWaypoint(
+            self, currentTime, wait_until, rotate_duration, self.current_waypoint, waypoint
+        )
+        
+        if success:
+            # Reservation successful
+            self.next_waypoint = waypoint
+            self._wait_until = wait_until
+            self._rotate_duration = rotate_duration
+            self._drive_duration = self.physics.getTimeNeededToMove(
+                0, self.current_waypoint.GetDistance(self.next_waypoint)
+            )
+            return True
+        else:
+            # Reservation failed
+            self.next_waypoint = None
+            self.instance.stat_overall_failed_reservations += 1
+            return False
+```
+
+### 5. Physics Calculations - EXACT FORMULAS
+
+```python
+class Physics:
+    """CRITICAL: Physics must match original C# implementation exactly."""
+    
+    def __init__(self, max_acceleration: float, max_deceleration: float, 
+                 max_velocity: float, turn_speed: float):
+        self.max_acceleration = max_acceleration
+        self.max_deceleration = max_deceleration
+        self.max_velocity = max_velocity
+        self.turn_speed = turn_speed  # radians per second
+    
+    def getTimeNeededToMove(self, initial_velocity: float, distance: float) -> float:
+        """Calculate time needed to travel distance with acceleration/deceleration."""
+        # Simplified: assume starting from rest and ending at rest
+        
+        # Distance needed to accelerate to max velocity
+        accel_distance = (self.max_velocity ** 2) / (2 * self.max_acceleration)
+        # Distance needed to decelerate from max velocity
+        decel_distance = (self.max_velocity ** 2) / (2 * self.max_deceleration)
+        
+        # Can we reach max velocity?
+        if accel_distance + decel_distance <= distance:
+            # Yes - accelerate, cruise, decelerate
+            time_accel = self.max_velocity / self.max_acceleration
+            time_decel = self.max_velocity / self.max_deceleration
+            time_cruise = (distance - accel_distance - decel_distance) / self.max_velocity
+            return time_accel + time_cruise + time_decel
+        else:
+            # No - accelerate then immediately decelerate
+            # Solve: distance = 0.5 * a * t1^2 + 0.5 * d * t2^2
+            # where v_max_actual = a * t1 = d * t2
+            v_max_actual = math.sqrt(
+                (2 * self.max_acceleration * self.max_deceleration * distance) /
+                (self.max_acceleration + self.max_deceleration)
+            )
+            time_accel = v_max_actual / self.max_acceleration
+            time_decel = v_max_actual / self.max_deceleration
+            return time_accel + time_decel
+    
+    def GetDistanceTraveledAfterTimeStep(self, initial_velocity: float, 
+                                         time_step: float) -> Tuple[float, float]:
+        """Returns (distance_traveled, current_speed)."""
+        # CRITICAL: Must handle acceleration, constant velocity, and deceleration phases
+        
+        time_to_max = self.max_velocity / self.max_acceleration
+        
+        if time_step <= time_to_max:
+            # Still accelerating
+            distance = 0.5 * self.max_acceleration * (time_step ** 2)
+            speed = self.max_acceleration * time_step
+            return distance, speed
+        else:
+            # Calculate total distance with deceleration at end
+            # This is complex - see original Physics.cs for exact formula
+            # For MVP: simplified version
+            distance_accel = 0.5 * self.max_acceleration * (time_to_max ** 2)
+            time_remaining = time_step - time_to_max
+            distance_cruise = self.max_velocity * time_remaining
+            return distance_accel + distance_cruise, self.max_velocity
+    
+    def getTimeNeededToTurn(self, start_orientation: float, 
+                           end_orientation: float) -> float:
+        """Calculate time needed to rotate from start to end orientation."""
+        # Calculate shortest angular distance
+        angle_diff = abs(Circle.GetOrientationDifference(start_orientation, end_orientation))
+        return angle_diff / self.turn_speed
+    
+    def getOrientationAfterTimeStep(self, start_orientation: float,
+                                    end_orientation: float,
+                                    time_step: float) -> float:
+        """Calculate orientation after partial rotation."""
+        angle_diff = Circle.GetOrientationDifference(start_orientation, end_orientation)
+        max_angle_change = self.turn_speed * time_step
+        
+        if abs(angle_diff) <= max_angle_change:
+            return end_orientation
+        else:
+            # Rotate towards target
+            direction = 1 if angle_diff > 0 else -1
+            return Circle.NormalizeOrientation(start_orientation + direction * max_angle_change)
+```
+
+### 6. Path Planning & Reservation System
+
+```python
+class PathManager:
+    """CRITICAL: Manages pathfinding and waypoint reservations."""
+    
+    def __init__(self, instance: Instance):
+        self.instance = instance
+        self.path_finder: PathFinder = None  # WHCAvStar or other algorithm
+        self._waypoint_ids: BiDict[Waypoint, int] = BiDict()
+        self._reservation_table: ReservationTable = None
+        self._reservations: Dict[BotNormal, List[ReservationTable.Interval]] = {}
+    
+    def Update(self, lastTime: float, currentTime: float):
+        """CRITICAL: Check if re-optimization needed."""
+        
+        # Manage queue managers
+        for queue_manager in self._queue_managers.values():
+            queue_manager.Update()
+        
+        # Reorganize reservation table
+        if self._reservation_table is None:
+            self._init_reservation_table()
+        self._reservation_table.Reorganize(currentTime)
+        
+        # Check if clocking interval exceeded
+        if self._last_call_timestamp + self.instance.controller_config.path_planning_config.clocking > currentTime:
+            return
+        
+        # Check if any bot requests reoptimization
+        reoptimize = any(bot.request_reoptimization for bot in self.instance.bots)
+        
+        if reoptimize:
+            self._last_call_timestamp = currentTime
+            self._reoptimize(currentTime)
+            # Reset flags
+            for bot in self.instance.bots:
+                bot.request_reoptimization = False
+    
+    def RegisterNextWaypoint(self, bot: BotNormal, currentTime: float,
+                            blockCurrentWaypointUntil: float,
+                            rotationDuration: float,
+                            waypointStart: Waypoint,
+                            waypointEnd: Waypoint) -> bool:
+        """CRITICAL: Reserve waypoints in reservation table."""
+        
+        # Create intervals for the movement
+        tmp_reservations = self._reservation_table.CreateIntervals(
+            currentTime,
+            blockCurrentWaypointUntil + rotationDuration,
+            0.0,
+            bot.physics,
+            self._waypoint_ids[waypointStart],
+            self._waypoint_ids[waypointEnd],
+            True
+        )
+        
+        if tmp_reservations is None:
+            return False  # Invalid waypoint
+        
+        # Special handling for elevators
+        if len(tmp_reservations) >= 2:
+            last_reservation = tmp_reservations[-1]
+            elevator_waypoint = self._waypoint_ids.get_key(last_reservation.node)
+            if elevator_waypoint.elevator is not None:
+                # Reserve all elevator connected waypoints
+                prelast = tmp_reservations[-2]
+                for wp in elevator_waypoint.elevator.connected_points:
+                    if wp != elevator_waypoint:
+                        tmp_reservations.append(
+                            ReservationTable.Interval(
+                                self._waypoint_ids[wp], prelast.start, prelast.end
+                            )
+                        )
+                        tmp_reservations.append(
+                            ReservationTable.Interval(
+                                self._waypoint_ids[wp], last_reservation.start, last_reservation.end
+                            )
+                        )
+        
+        # Remove current reservations
+        self._reservation_table.Remove(self._reservations[bot])
+        
+        # Check if free
+        free = self._reservation_table.IntersectionFree(tmp_reservations)
+        
+        # Check pod collision
+        if bot.pod is not None:
+            for interval in tmp_reservations:
+                waypoint = self._waypoint_ids.get_key(interval.node)
+                if waypoint.pod is not None:
+                    free = False
+                    break
+        
+        if free:
+            # Accept reservation
+            self._reservations[bot] = tmp_reservations
+            self._reservation_table.Add(tmp_reservations)
+            return True
+        else:
+            # Re-add old reservation
+            self._reservation_table.Add(self._reservations[bot])
+            return False
+```
+
+### 7. Queue Management - CRITICAL for Stations & Elevators
+
+```python
+class QueueManager:
+    """CRITICAL: Manages bot queuing at stations and elevators."""
+    
+    def __init__(self, queue_waypoint: Waypoint, queue: List[Waypoint], 
+                 path_manager: PathManager):
+        self.queue_waypoint = queue_waypoint  # Terminal waypoint (station/elevator)
+        self.queue = queue  # List of waypoints forming the queue (ordered)
+        self.locked_waypoints: Dict[Waypoint, Bot] = {}  # Currently locked positions
+        self._managed_bots: List[BotNormal] = []  # Bots in queue management
+        self._bots_in_queue: Set[BotNormal] = set()  # Bots physically in queue
+        self._place_in_queue: Dict[BotNormal, Waypoint] = {}  # Assigned positions
+    
+    def Update(self):
+        """CRITICAL: Update queue state and assign positions."""
+        
+        if len(self._managed_bots) == 0:
+            return
+        
+        # Reset locked waypoints
+        self.locked_waypoints.clear()
+        self._bots_in_queue.clear()
+        
+        # Lock elevator destination if in use
+        if self.queue_waypoint.elevator is not None and self.queue_waypoint.elevator.in_use:
+            self.locked_waypoints[self.queue_waypoint] = None
+        
+        # Check each managed bot
+        for i in range(len(self._managed_bots) - 1, -1, -1):  # Reverse iteration
+            bot = self._managed_bots[i]
+            next_wp = bot.next_waypoint if bot.next_waypoint is not None else bot.current_waypoint
+            
+            current_in_queue = bot.current_waypoint in self.queue
+            next_in_queue = next_wp in self.queue
+            
+            # Check if bot is leaving queue
+            if (bot.destination_waypoint != self.queue_waypoint and 
+                bot.current_waypoint == self.queue_waypoint) or \
+               (not current_in_queue and not next_in_queue and 
+                bot.destination_waypoint != self.queue_waypoint):
+                # Remove from management
+                if self.queue_waypoint.elevator is not None and bot == self.queue_waypoint.elevator.used_by:
+                    self.queue_waypoint.elevator.in_use = False
+                    self.queue_waypoint.elevator.used_by = None
+                self._managed_bots.pop(i)
+                bot.is_queueing = False
+                continue
+            
+            # Bot is in queue
+            if current_in_queue:
+                self._bots_in_queue.add(bot)
+                bot.is_queueing = True
+                
+                # Lock waypoints
+                locks_current = bot.current_waypoint.GetDistance(bot) <= self._max_edge_length[bot.current_waypoint]
+                if locks_current and bot.current_waypoint not in self.locked_waypoints:
+                    self.locked_waypoints[bot.current_waypoint] = bot
+                if next_in_queue and next_wp not in self.locked_waypoints:
+                    self.locked_waypoints[next_wp] = bot
+            
+            # Bot reached queue terminal - no longer queueing
+            if bot.current_waypoint == self.queue[0]:
+                bot.is_queueing = False
+                self._bots_in_queue.discard(bot)
+        
+        # Reset place assignments
+        self._place_in_queue.clear()
+        
+        # Assign moving bots
+        for bot in self._bots_in_queue:
+            if bot.current_waypoint != bot.next_waypoint and bot.next_waypoint is not None:
+                self._place_in_queue[bot] = bot.next_waypoint
+        
+        # Assign standing bots to next free position
+        for bot in self._bots_in_queue:
+            if bot not in self._place_in_queue:
+                queue_index = self.queue.index(bot.current_waypoint)
+                
+                if queue_index == 0 or self.queue[queue_index - 1] in self.locked_waypoints:
+                    # Can't advance - stay here
+                    self._place_in_queue[bot] = bot.current_waypoint
+                else:
+                    # Advance in queue
+                    target_index = queue_index - 1
+                    # Find furthest free position
+                    while target_index > 0 and self.queue[target_index - 1] not in self.locked_waypoints:
+                        target_index -= 1
+                    
+                    # Build path through queue
+                    path = Path()
+                    for idx in range(queue_index, target_index - 1, -1):
+                        self.locked_waypoints[self.queue[idx]] = bot
+                        path.AddLast(
+                            self._path_manager.GetNodeIdByWaypoint(self.queue[idx]),
+                            stop_at_node=True,
+                            wait_time=0.0
+                        )
+                    
+                    bot.path = path
+                    self._place_in_queue[bot] = self.queue[target_index]
+        
+        # Assign bots not yet in queue to available positions
+        first_free_node = len(self.queue) - 1
+        while first_free_node > 0 and self.queue[first_free_node - 1] not in self.locked_waypoints:
+            first_free_node -= 1
+        
+        # Elevator special case
+        if first_free_node == 0 and self.queue_waypoint.elevator is not None:
+            first_free_node = 1
+        
+        # Assign remaining bots by distance
+        bots_left = [bot for bot in self._managed_bots if bot not in self._place_in_queue]
+        while bots_left:
+            # Find nearest bot to current free position
+            nearest_bot = min(bots_left, 
+                            key=lambda b: self.queue[first_free_node].GetDistance(b))
+            bots_left.remove(nearest_bot)
+            self._place_in_queue[nearest_bot] = self.queue[first_free_node]
+            first_free_node = min(first_free_node + 1, len(self.queue) - 1)
+        
+        # Never lock last queue node
+        if self.queue[-1] in self.locked_waypoints:
+            del self.locked_waypoints[self.queue[-1]]
+```
+
+### 8. Waypoint Graph & Connectivity
+
+```python
+class Waypoint:
+    """CRITICAL: Waypoints form the navigation graph."""
+    
+    def __init__(self, instance: Instance):
+        self.instance = instance
+        self._paths: Dict[Waypoint, float] = {}  # Connected waypoints → distance
+        self._guards: Dict[Waypoint, List[QueueGuard]] = {}  # Dynamic blocking
+        self.pod_storage_location: bool = False
+        self.is_queue_waypoint: bool = False
+        self.queue_manager: QueueManager = None
+        self.output_station: OutputStation = None
+        self.input_station: InputStation = None
+        self.elevator: Elevator = None
+        self.pod: Pod = None
+    
+    def AddPath(self, other: Waypoint):
+        """Add directed connection to another waypoint."""
+        self._paths[other] = self.GetDistance(other)
+    
+    def AddBidirectionalPath(self, other: Waypoint):
+        """Add bidirectional connection."""
+        self._paths[other] = self.GetDistance(other)
+        other.AddPath(self)
+    
+    def GetPathDistance(self, other: Waypoint) -> float:
+        """CRITICAL: Returns infinity if path is blocked by guards."""
+        if other in self._paths:
+            # Check if path is blocked by queue guards
+            if self.instance.setting_config.queue_handling_enabled and \
+               other in self._guards and \
+               not all(g.is_accessible for g in self._guards[other]):
+                return float('inf')
+            return self._paths[other]
+        return float('inf')
+    
+    def IsAccessible(self, other: Waypoint) -> bool:
+        """Check if waypoint is directly accessible (not blocked)."""
+        return (other in self._paths and
+                (not self.instance.setting_config.queue_handling_enabled or
+                 other not in self._guards or
+                 all(g.is_accessible for g in self._guards[other])))
+```
+
+### 9. Control Flow - Task Assignment
+
+```python
+class BotManager:
+    """CRITICAL: Manages task assignment to bots."""
+    
+    def RequestNewTask(self, bot: BotNormal):
+        """Called when bot completes task and needs new assignment."""
+        # Get task from task allocator
+        task = self.instance.controller.task_allocator.GetTask(bot)
+        
+        if task is not None:
+            bot.AssignTask(task)
+        else:
+            # No task available - send to rest
+            rest_location = self.instance.controller.GetRestingLocation(bot)
+            bot.AssignTask(RestTask(rest_location))
+    
+    def TaskComplete(self, bot: BotNormal, task: BotTask):
+        """Called when bot completes a task."""
+        # Update statistics
+        task.completion_time = self.instance.controller.current_time
+        
+        # Notify managers
+        if task.type == BotTaskType.EXTRACT:
+            # Order completed
+            self.instance.controller.order_manager.CompleteOrder(task.order)
+        elif task.type == BotTaskType.INSERT:
+            # Bundle stored
+            self.instance.controller.inventory_manager.BundleStored(task.bundle)
+```
+
+## Critical Implementation Rules
+
+### DO's:
+1. ✅ Always use discrete event simulation pattern
+2. ✅ Maintain FIFO state queue for bot behavior
+3. ✅ Use three-phase movement: Wait → Rotate → Drive
+4. ✅ Check blocking conditions before every state action
+5. ✅ Use reservation table for waypoint conflict resolution
+6. ✅ Handle elevators as special multi-waypoint reservations
+7. ✅ Implement queue management for stations and elevators
+8. ✅ Clear state queue when assigning new task
+9. ✅ Use Physics class for all movement calculations
+10. ✅ Respect queue guards for dynamic path blocking
+
+### DON'Ts:
+1. ❌ Never use single state variable - always use state queue
+2. ❌ Never allow movement without waypoint reservation
+3. ❌ Never assign new task without clearing old states
+4. ❌ Never skip rotation phase if orientation differs
+5. ❌ Never allow pod collision (check before reservation)
+6. ❌ Never modify physics formulas - match C# exactly
+7. ❌ Never update bot while blocked (_wait_until check)
+8. ❌ Never forget to handle elevator tier transitions
+9. ❌ Never allow queue terminal to be locked permanently
+10. ❌ Never reoptimize more frequently than clocking interval
+
+## Testing Checklist
+
+```python
+# Test 1: Bot state transitions
+assert bot._state_queue.qsize() == 0  # Initially empty
+bot.AssignTask(ExtractTask(...))  # Assign task
+assert bot._state_queue.qsize() > 0  # States added
+
+# Test 2: Movement physics
+time_needed = bot.physics.getTimeNeededToMove(0, 10.0)
+assert time_needed > 0
+dist, speed = bot.physics.GetDistanceTraveledAfterTimeStep(0, time_needed)
+assert abs(dist - 10.0) < 0.001  # Should match
+
+# Test 3: Waypoint reservation
+success = bot.setNextWaypoint(target_wp, current_time)
+if success:
+    assert bot.next_waypoint == target_wp
+    assert len(path_manager._reservations[bot]) > 0
+
+# Test 4: Queue management
+queue_manager.onBotJoinQueue(bot)
+assert bot in queue_manager._managed_bots
+queue_manager.Update()
+assert len(queue_manager._place_in_queue) > 0
+
+# Test 5: Discrete event execution
+next_event = min(entity.GetNextEventTime(current_time) for entity in updateables)
+assert next_event >= current_time
+```
+
+## Performance Optimization Notes
+
+1. **Reservation Table**: Use interval trees for O(log n) intersection checks
+2. **Pathfinding**: Cache shortest paths between frequently used waypoint pairs
+3. **Queue Management**: Use QuadTree for nearest waypoint lookup in O(log n)
+4. **Statistics**: Only track when enabled in configuration
+5. **Collision Detection**: Use spatial hashing for bot proximity checks
+
+## Configuration-Driven Behavior
+
+```python
+# CRITICAL: Many behaviors are configuration-driven
+if instance.setting_config.use_acceleration:
+    # Use full physics with acceleration/deceleration
+    pass
+else:
+    # Use instant top speed
+    pass
+
+if instance.setting_config.use_turn_delay:
+    # Calculate rotation time
+    pass
+else:
+    # Instant orientation change
+    pass
+
+if instance.setting_config.queue_handling_enabled:
+    # Use queue managers and guards
+    pass
+else:
+    # Ignore queues
+    pass
+```
+
+## End of Cursor Rules
+
+These rules capture the exact logic patterns from the original C# RAWSim-O implementation.
+When implementing or modifying this Python version, always refer back to these patterns.
