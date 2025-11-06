@@ -1,0 +1,26 @@
+{
+  "name": "DefaultWarehouse",
+  "description": "A simple warehouse instance for testing",
+  "tiers": [
+    {
+      "id": 0,
+      "length": 50.0,
+      "width": 30.0,
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    }
+  ],
+  "bots": 10,
+  "pods": 50,
+  "waypoints": "auto-generated",
+  "input_stations": 2,
+  "output_stations": 3,
+  "layout": {
+    "type": "grid",
+    "aisle_width": 3.0,
+    "waypoint_spacing": 2.0
+  }
+}
