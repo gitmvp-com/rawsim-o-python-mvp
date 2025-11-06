@@ -1,0 +1,22 @@
+# Core dependencies
+numpy>=1.21.0
+scipy>=1.7.0
+
+# Visualization
+pygame>=2.1.0
+
+# Configuration and data handling
+pyyaml>=6.0
+
+# Command-line interface
+click>=8.0.0
+
+# Logging and utilities
+colorama>=0.4.4
+tqdm>=4.62.0
+
+# Data structures
+sortedcontainers>=2.4.0
+
+# Optional: Performance optimization
+# numba>=0.54.0  # Uncomment for JIT compilation speed boost
